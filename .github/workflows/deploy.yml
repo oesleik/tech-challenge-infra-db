@@ -1,0 +1,118 @@
+name: Deploy
+
+# Manual only. Segundo da cadeia: infra-k8s -> infra-db -> app -> lambda.
+on:
+  workflow_dispatch:
+    inputs:
+      rds_instance_class:
+        description: "Classe da instância Amazon RDS MySQL"
+        type: choice
+        required: true
+        default: db.t3.micro
+        options:
+          - db.t3.micro
+          - db.t4g.micro
+
+concurrency:
+  group: infra-db
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  AWS_REGION: us-east-1
+  TF_STATE_KEY: tech-challenge/infra-db.tfstate
+  SSM_PREFIX: /tech-challenge
+
+jobs:
+  deploy:
+    name: Terraform apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require master branch
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/master" ]; then
+            echo "Rode este workflow com a branch master selecionada."
+            exit 1
+          fi
+
+      - name: Require secrets and variables
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          TF_STATE_LOCK_TABLE: ${{ vars.TF_STATE_LOCK_TABLE }}
+          DB_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+        run: |
+          set -eu
+          missing=0
+          for name in TF_STATE_BUCKET TF_STATE_LOCK_TABLE DB_ROOT_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} ausente. Defina em Settings > Secrets and variables > Actions (README.md)."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN_APPLY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Fail-fast do contrato: a rede e o cluster vêm do tech-challenge-infra-k8s.
+      - name: Require infra-k8s contract
+        run: |
+          set -eu
+          missing=0
+          for name in network/vpc_id network/private_subnet_ids eks/cluster_security_group_id; do
+            if ! aws ssm get-parameter --name "${SSM_PREFIX}/${name}" >/dev/null 2>&1; then
+              echo "::error::${SSM_PREFIX}/${name} não existe. Rode o Deploy do tech-challenge-infra-k8s antes."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ vars.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform plan
+        env:
+          TF_VAR_rds_instance_class: ${{ inputs.rds_instance_class }}
+          TF_VAR_rds_master_password: ${{ secrets.DB_ROOT_PASSWORD }}
+        run: terraform plan -var-file=env/aws.tfvars -out=tfplan -no-color
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Summary
+        run: |
+          {
+            echo "### RDS: $(terraform output -raw db_address)"
+            echo
+            echo "Parâmetros SSM publicados:"
+            terraform output -json ssm_parameters | jq -r '.[] | "- `" + . + "`"'
+            echo
+            echo "Próximo passo: **Deploy** do tech-chalange (aplicação)."
+          } >> "$GITHUB_STEP_SUMMARY"
